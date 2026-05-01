@@ -1,4 +1,6 @@
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
@@ -7,11 +9,24 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
+PORT = int(os.getenv("PORT", "10000"))
 GOFILE_API = "https://api.gofile.io"
 
 # Conversation states
 WAITING_FOR_FILE = 1
 WAITING_FOR_DELETE = 2
+
+# ---------- SIMPLE HEALTH CHECK SERVER ----------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"🔌 Health server listening on port {PORT}")
+    server.serve_forever()
 
 # ---------- SECURITY CHECK ----------
 def is_authorized(update: Update) -> bool:
@@ -53,13 +68,11 @@ async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_FILE
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Get the file from Telegram
     file = update.message.document or update.message.photo[-1] if update.message.photo else None
     
     if not file and update.message.document:
         file = update.message.document
     elif not file:
-        # Try to get any file
         file = update.message.effective_attachment
         if hasattr(file, 'file_id'):
             file = file
@@ -67,16 +80,13 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Please send a valid file.")
             return WAITING_FOR_FILE
     
-    # Download file from Telegram
     telegram_file = await context.bot.get_file(update.message.document.file_id)
     file_bytes = await telegram_file.download_as_bytearray()
     file_name = update.message.document.file_name or "unnamed_file"
     
     await update.message.reply_text("⏳ Uploading to Gofile...")
     
-    # Upload to Gofile
     try:
-        # Get a server to upload to
         server_res = requests.get(f"{GOFILE_API}/servers").json()
         if server_res["status"] != "ok":
             await update.message.reply_text("❌ Failed to get Gofile server.")
@@ -84,7 +94,6 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         server = server_res["data"]["servers"][0]["name"]
         
-        # Upload the file
         upload_res = requests.post(
             f"https://{server}.gofile.io/uploadFile",
             files={"file": (file_name, bytes(file_bytes))},
@@ -154,7 +163,6 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return ConversationHandler.END
     
-    # First, show files so user knows what to delete
     try:
         res = requests.get(f"{GOFILE_API}/contents", params={"token": GOFILE_TOKEN}).json()
         data = res["data"]
@@ -213,9 +221,12 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- MAIN ----------
 def main():
+    # Start the health check server in a separate thread
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # Start the Telegram bot
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Upload conversation
     upload_conv = ConversationHandler(
         entry_points=[CommandHandler("upload", upload_start)],
         states={
@@ -224,7 +235,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Delete conversation
     delete_conv = ConversationHandler(
         entry_points=[CommandHandler("delete", delete_start)],
         states={
